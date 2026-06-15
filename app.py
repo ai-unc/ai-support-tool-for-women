@@ -42,7 +42,7 @@ CONCERN_EMBEDDINGS = {
         normalize_embeddings=True
     ),
     "red_flag": embedding_model.encode(
-        "fever mastitis abscess baby not feeding at all dehydration no wet diapers blood severe infection emergency",
+        "fever mastitis abscess baby not feeding at all dehydration no wet diapers blood severe infection emergency dry mouth sunken fontanelle lethargic jaundice not waking to feed",
         normalize_embeddings=True
     ),
     "concern": embedding_model.encode(
@@ -55,8 +55,8 @@ THRESHOLDS = {
     "pain": 0.15,
     "latch": 0.15,
     "supply": 0.15,
-    "stress": 0.15,
-    "red_flag": 0.50, 
+    "stress": 0.25,    
+    "red_flag": 0.42,  
     "concern": 0.20,
 }
 
@@ -76,39 +76,31 @@ def check_hard_medical_red_flags(user_input, chat_history):
     for msg in chat_history:
         combined_text += " " + msg["content"].lower()
 
-    # ── NEW: Baby danger signals (fever, feeding refusal) ──────────────────
     infant_danger_words = [
-        "fever", "not drinking", "not eating", "won't eat", "won't drink",
-        "not feeding", "refusing to feed", "refusing to eat", "hasn't fed",
-        "not fed", "won't feed"
+        "fever", "has a temp", "high temperature", "not drinking at all", 
+        "won't eat", "refusing to feed", "refusing to eat", "hasn't fed at all"
     ]
     baby_words = ["baby", "infant", "newborn", "he", "she", "they"]
     if (
         any(d in combined_text for d in infant_danger_words)
         and any(b in combined_text for b in baby_words)
-        # make sure it isn't the mother describing her own fever + breast issue
-        # (that case is caught by the maternal block below)
         and not (
             any(inf in combined_text for inf in ["mastitis", "streaks", "chills", "flu-like"])
             and any(br in combined_text for br in ["breast", "nipple", "boob"])
         )
     ):
-        print("🚨 INFANT DANGER FLAG: Baby fever/feeding refusal detected!", flush=True)
-        return "INFANT_URGENT"
-    # ── END NEW BLOCK ───────────────────────────────────────────────────────
+        return "INFANT_CRISIS"
 
     diaper_pattern = r"\b(1|2|3|4|one|two|three|four)\b\s*(wet)?\s*diaper"
     feed_pattern = r"\b(1|2|3|4|one|two|three|four)\b\s*(feeds|feedings|times)\s*(a|per)?\s*day"
     
-    if re.search(diaper_pattern, combined_text) and "more than" not in combined_text and "at least" not in combined_text:
-        return "INFANT_URGENT"
-    if re.search(feed_pattern, combined_text):
-        return "INFANT_URGENT"
+    if "more than" not in combined_text and "at least" not in combined_text:
+        if re.search(diaper_pattern, combined_text) or re.search(feed_pattern, combined_text):
+            return "LOW_COUNTS_URGENT"
 
     infection_words = ["fever", "mastitis", "101", "102", "103", "104", "chills", "streaks", "flu-like"]
     breast_words = ["breast", "nipple", "boob"]
     if any(inf in combined_text for inf in infection_words) and any(br in combined_text for br in breast_words):
-        print("🚨 HARD MEDICAL FLAG TRIGGERED: Potential systemic breast infection detected!", flush=True)
         return "MATERNAL_URGENT"
 
     return None
@@ -126,17 +118,15 @@ def score_text_concern(user_input, chat_history):
         normalize_embeddings=True
     )
 
-    scores = {k: 0 for k in CONCERN_EMBEDDINGS.keys()}
+    raw_scores = {}
+    flags = {}
 
-    print("\n--- SEMANTIC SIMILARITY DEBUG ---", flush=True)
     for category, concern_vec in CONCERN_EMBEDDINGS.items():
         similarity = float(np.dot(context_vec, concern_vec))
-        print(f"Category: {category:<10} | Score: {similarity:.3f} | Triggered: {similarity >= THRESHOLDS[category]}", flush=True)
-        if similarity >= THRESHOLDS[category]:
-            scores[category] = 1
-    print("---------------------------------\n", flush=True)
+        raw_scores[category] = similarity
+        flags[category] = 1 if similarity >= THRESHOLDS[category] else 0
 
-    return scores
+    return raw_scores, flags
 
 
 def detect_detail_level(text):
@@ -171,33 +161,29 @@ def baby_age_known(chat_history, user_input):
     all_text = user_input.lower()
     for msg in chat_history:
         all_text += " " + msg["content"].lower()
-    age_words = ["day", "days", "week", "weeks", "month", "months", "old", "newborn", "infant"]
-    return any(w in all_text for w in age_words)
+    age_pattern = r'\b\d+\s*(day|days|week|weeks|month|months)\s*(old)?\b'
+    explicit_terms = ["newborn", "infant"]
+    return bool(re.search(age_pattern, all_text)) or any(w in all_text for w in explicit_terms)
 
 
 def needs_clarification(user_input, chat_history):
     text = user_input.lower()
-    concern_words = [
-        "enough milk", "hungry", "feeding", "feed", "latch", 
-        "milk supply", "not satisfied", "getting enough", "weight gain"
-    ]
-
-    concern_detected = any(word in text for word in concern_words)
-    if "does" in text or "what is" in text or "why do" in text:
-        concern_detected = False
-
     all_text = text + " " + " ".join([msg["content"].lower() for msg in chat_history])
 
-    age_known = any(w in all_text for w in ["day old", "days old", "week old", "weeks old", "month old", "months old", "newborn"])
-    feeding_known = any(w in all_text for w in ["times a day", "feeds a day", "feeding every", "every 2 hours", "every 3 hours"])
-    
-    diaper_known = False
-    if any(phrase in all_text for phrase in ["wet diaper", "wet diapers"]):
-        if not any(f"{n}" in all_text for n in ["1", "2", "3", "4", "one", "two", "three", "four"]):
-            diaper_known = True
+    age_known = bool(re.search(r'\b\d+\s*(day|days|week|weeks|month|months)\s*(old)?\b', all_text)) \
+        or any(w in all_text for w in ["newborn", "infant"])
+        
+    feeding_known = any(w in all_text for w in [
+        "breastfeeding", "breastfeed", "breast fed", "formula", "pumping", "pump", "combination",
+        "times a day", "feeds a day", "feeding every", "every 2 hours", "every 3 hours",
+        "times per day", "feeds per day", "8 times", "10 times", "12 times",
+    ])
+
+    diaper_known = any(phrase in all_text for phrase in ["wet diaper", "wet diapers", "diapers wet"]) or \
+                   bool(re.search(r'\b\d+\s*wet\s*diaper', all_text))
 
     context_score = sum([age_known, diaper_known, feeding_known])
-    return context_score < 2
+    return context_score < 3
 
 
 def is_closing_message(user_input):
@@ -209,44 +195,31 @@ def is_closing_message(user_input):
     return any(phrase in user_input.lower() for phrase in closing_words)
 
 
-def route_request(scores, user_input, chat_history):
+def route_request(scores, flags, user_input, chat_history):
     if is_closing_message(user_input):
         return "CLOSING"
 
     flag_status = check_hard_medical_red_flags(user_input, chat_history)
-    if flag_status == "INFANT_URGENT":
+    if flag_status == "INFANT_CRISIS":
         return "URGENT_INFANT"
+    elif flag_status == "LOW_COUNTS_URGENT":
+        return "URGENT_LOW_COUNTS"
     elif flag_status == "MATERNAL_URGENT":
         return "URGENT_MATERNAL"
+
+    if flags["pain"] or flags["latch"]:
+        if not needs_clarification(user_input, chat_history):
+            return "CLINICAL"
 
     if needs_clarification(user_input, chat_history):
         return "QUESTION_FIRST"
 
-    if scores["red_flag"]:
-        return "URGENT_MATERNAL"
-
-    if scores["stress"]:
+    clinical_score = flags["pain"] + flags["latch"] + flags["supply"]
+    if flags["stress"] and clinical_score == 0 and not flags["concern"]:
         return "SUPPORT"
 
-    if scores["concern"] and not (scores["pain"] or scores["latch"] or scores["supply"]):
+    if flags["concern"] and not (flags["pain"] or flags["latch"] or flags["supply"]):
         return "REASSURE"
-
-    state = get_conversation_state(chat_history)
-    detail = detect_detail_level(user_input)
-    follow_up_words = ["yes", "yeah", "ok", "okay", "correct", "right", "yep", "yup"]
-
-    if user_input.strip().lower() in follow_up_words and state == "ACTIVE_BREASTFEEDING_THREAD":
-        return "CLINICAL"
-
-    clinical_score = scores["pain"] + scores["latch"] + scores["supply"]
-    if clinical_score >= 1:  
-        return "CLINICAL"
-
-    if state == "ACTIVE_BREASTFEEDING_THREAD" and detail in ["DETAILED", "NEUTRAL"]:
-        return "CLINICAL"
-
-    if detail == "VAGUE":
-        return "QUESTION_FIRST"
 
     return "CLINICAL"
 
@@ -266,75 +239,156 @@ def submit():
         session["chat_history"] = []
     chat_history = session["chat_history"]
 
+    scores, flags = score_text_concern(user_input, chat_history)
+    route = route_request(scores, flags, user_input, chat_history)
     flag_status = check_hard_medical_red_flags(user_input, chat_history)
     
-    if flag_status == "INFANT_URGENT":
-        infant_response = """
-<h3>⚠️ Seek Immediate Pediatric Care</h3>
-<p>Your baby's symptoms — including <strong>fever and/or feeding refusal</strong> — require prompt medical evaluation. Do not wait.</p>
-<ul>
-    <li><strong>Call your pediatrician or go to the ER now.</strong></li>
-    <li>Fever in infants under 3 months is always a medical emergency.</li>
-    <li>A baby refusing to feed alongside a fever can indicate serious illness.</li>
-    <li>Newborns generally need to feed <strong>8–12 times per 24 hours</strong>. Significantly fewer feeds or wet diapers than expected is also a reason to seek care immediately.</li>
-</ul>
-"""
-        return render_template("result.html", user_input=user_input, response=infant_response)
+    if flag_status == "INFANT_CRISIS":
+        infant_crisis_response = """
+        <div class="triage-alert">
+            <h3>⚠️ Seek Immediate Pediatric Care</h3>
+            <p>Your baby's symptoms — including <strong>fever and/or direct feeding refusal</strong> — require prompt medical evaluation. Do not wait.</p>
+            <ul>
+                <li><strong>Call your pediatrician or visit the ER immediately.</strong></li>
+                <li>Fever in young infants is always treated as a medical emergency.</li>
+                <li>An absolute refusal to feed combined with high temperature requires rapid clinical assessment.</li>
+            </ul>
+        </div>
+        """
+        return render_template("result.html", user_input=user_input, response=infant_crisis_response)
+
+    elif flag_status == "LOW_COUNTS_URGENT":
+        low_count_response = """
+        <div class="triage-alert">
+            <h3>⚠️ Low Intake / Output Metrics Noted</h3>
+            <p>You mentioned that your baby has had a low number of wet diapers or daily feedings. While this may not be a crisis if the baby is alert and responsive, low output requires careful management.</p>
+            <ul>
+                <li><strong>Monitor Closely:</strong> Infants typically need 6+ wet diapers and 8–12 regular feedings per 24 hours to stay adequately hydrated.</li>
+                <li><strong>Coordinate Care:</strong> Contact your healthcare provider or a lactation consultant today to arrange a physical evaluation and weight check.</li>
+                <li><strong>When to go to the ER:</strong> If your baby displays extreme lethargy, is difficult to wake up, develops a dry mouth/sunken soft spot, or experiences a fever, seek emergency medical care instantly.</li>
+            </ul>
+        </div>
+        """
+        return render_template("result.html", user_input=user_input, response=low_count_response)
 
     elif flag_status == "MATERNAL_URGENT":
         maternal_response = """
-<h3>⚠️ Immediate Medical Evaluation Recommended</h3>
-<p>Your symptoms strongly point toward a systemic infection like <strong>mastitis</strong>.</p>
-<ul>
-    <li><strong>Seek Professional Care Immediately:</strong> Contact your provider or visit an urgent care today.</li>
-    <li><strong>Breastfeeding Guidance:</strong> Standard guidelines advise continuing to breastfeed or pump frequently on the affected side to clear the blockage unless advised otherwise by a doctor.</li>
-</ul>
-"""
+        <div class="triage-alert">
+            <h3>⚠️ Immediate Medical Evaluation Recommended</h3>
+            <p>Your symptoms strongly point toward a systemic infection like <strong>mastitis</strong>.</p>
+            <ul>
+                <li><strong>Seek Professional Care Immediately:</strong> Contact your provider or visit an urgent care today.</li>
+                <li><strong>Breastfeeding Guidance:</strong> Standard guidelines advise continuing to breastfeed or pump frequently on the affected side to clear the blockage unless advised otherwise by a doctor.</li>
+            </ul>
+        </div>
+        """
         return render_template("result.html", user_input=user_input, response=maternal_response)
 
-    scores = score_text_concern(user_input, chat_history)
-    route = route_request(scores, user_input, chat_history)
-    
     retrieved_context = ""
-    if route in ["CLINICAL", "URGENT_INFANT", "URGENT_MATERNAL", "QUESTION_FIRST"]:
-        search_results = search(user_input, faiss_index, chunks, k=2)
+    retrieval_scores_list = []
+    if route in ["CLINICAL", "URGENT_INFANT", "URGENT_LOW_COUNTS", "URGENT_MATERNAL", "QUESTION_FIRST", "SUPPORT"]:
+        search_results, retrieval_scores_list = search(user_input, faiss_index, chunks, k=2)
         if search_results:
             retrieved_context = "\n".join(search_results)
 
     intent_handling_directive = (
         "USER INTENT HANDLING DIRECTIVE:\n"
-        "1. Distinguish between an objective, general educational question (e.g., 'Does latching hurt?') "
-        "and a personal symptom disclosure (e.g., 'My nipples hurt when latching').\n"
-        "2. If the user's input is a general/educational question, provide a direct, objective medical answer "
-        "using the retrieved context first. Do NOT use phrasing that assumes the user is actively suffering from "
-        "or experiencing the symptom firsthand (avoid 'I'm sorry you are dealing with this pain').\n"
-        "3. If the user explicitly mentions they are personally experiencing a symptom or issue, then adopt a supportive, "
-        "empathetic tone and follow intake workflows.\n\n"
+        "1. Distinguish between an objective, general educational question and a personal symptom disclosure.\n"
+        "2. If the user's input is a general/educational question, provide a direct, objective medical answer.\n"
+        "3. If the user explicitly mentions they are personally experiencing a symptom, adopt an empathetic tone and follow workflows.\n\n"
     )
 
     if route == "QUESTION_FIRST":
+        all_text = user_input.lower() + " " + " ".join([m["content"].lower() for m in chat_history])
+        age_known = bool(re.search(r'\b\d+\s*(day|days|week|weeks|month|months)\s*(old)?\b', all_text)) \
+            or any(w in all_text for w in ["newborn", "infant"])
+        feeding_known = any(w in all_text for w in [
+            "breastfeeding", "breastfeed", "breast fed", "formula", "pumping", "pump",
+            "combination", "times a day", "feeds a day", "feeding every",
+        ])
+        diaper_known = any(phrase in all_text for phrase in ["wet diaper", "wet diapers", "diapers wet"]) or \
+                       bool(re.search(r'\b\d+\s*wet\s*diaper', all_text))
+
+        unknown_facts = []
+        if not age_known:
+            unknown_facts.append("how old your baby is (in days or weeks)")
+        if not feeding_known:
+            unknown_facts.append("how you are currently feeding (breast, pump, or formula)")
+        if not diaper_known:
+            unknown_facts.append("the number of wet diapers in the last 24 hours")
+
+        if unknown_facts:
+            # We create a very explicit string for the model to include
+            missing_str = " and ".join(unknown_facts)
+            clarification_directive = (
+                "You are a helpful maternal health assistant. The user's query is too vague to provide clinical guidance.\n\n"
+                "STRICT INSTRUCTION:\n"
+                f"1. You MUST ask the user for: {missing_str}.\n"
+                "2. Do not provide any medical advice, tips, or 'normal' ranges yet.\n"
+                "3. Start with a brief empathetic opening, then ask the missing questions clearly.\n"
+                "4. Keep your total response under 40 words.\n"
+            )
+        else:
+            clarification_directive = (
+                "Ask one focused follow-up question to better understand the concern.\n"
+            )
+
         system_prompt = (
-            "You are an empathetic maternal health assistant. The user has raised a breastfeeding or supply concern, "
-            "but key details are missing (such as the baby's precise age or feeding/wet diaper frequencies).\n\n"
+            f"{clarification_directive}\n"
+            f"Grounding Context (Use for tone only, do not cite facts yet):\n{retrieved_context}\n"
+        )
+
+        system_prompt = (
+            f"{clarification_directive}"
+            f"Grounding Context:\n{retrieved_context}\n\n"
+        )
+    elif route == "SUPPORT":
+        system_prompt = (
+            "You are a warm, compassionate maternal health assistant. This mother is struggling emotionally. "
+            "Start by validating her feelings genuinely and specifically. Offer 1–2 gentle, practical suggestions.\n\n"
+            f"Grounding Context:\n{retrieved_context}\n\n"
+        )
+    elif route == "REASSURE":
+        system_prompt = (
+            "You are a calm, reassuring maternal health assistant. The user has expressed a worry or concern "
+            "but there are no red flags or clinical symptoms indicated.\n\n"
+            "REASSURE DIRECTIVE:\n"
+            "- Lead with normalisation: explain that what they're noticing is common and usually not a cause for concern.\n"
+            "- Provide 2–3 concrete, observable signs that things ARE going well (e.g. wet diapers, weight gain, feeding cues).\n"
+            "- Close with a clear, low-stress next step or a simple 'when to seek help' note.\n"
+            "- Tone: warm and confident. Not dismissive — acknowledge their concern genuinely.\n\n"
             f"{intent_handling_directive}"
-            "CRITICAL DIRECTIVE:\n"
-            "If the message is an objective question, answer it neutrally. If it is a personal problem missing details, "
-            "warmly validate their concern and explicitly ask them to share how old their baby is and how often they feed so you can give them customized context."
+            f"Grounding Context:\n{retrieved_context}\n\n"
         )
     else:
         system_prompt = (
-            "You are a helpful maternal health assistant. Answer the user's inquiry based strictly on the provided context.\n"
+            "You are a helpful and empathetic maternal health assistant and lactation consultant.\n\n"
+            "CRITICAL INTEGRITY INSTRUCTION:\n"
+            "Review the 'Current User Input' and 'Conversation History' fields carefully. "
+            "NEVER state, imply, or assume the user or their baby is experiencing specific symptoms "
+            "(e.g., slow weight gain, specific low diaper counts, bleeding) UNLESS the user explicitly stated "
+            "those symptoms in their messages. Treat the 'Grounding Context' strictly as an objective reference textbook, "
+            "not a description of the current patient.\n\n"
+            "RESPONSE STRATEGY:\n"
+            "1. Acknowledge what the user shared. If their message is brief, address it generally without assuming pathologies.\n"
+            "2. Read the Conversation History carefully. Do not repeat questions already answered.\n"
+            "3. Offer 2-3 practical, supportive educational insights based on the Grounding Context. Frame them objectively "
+            "(e.g., 'In general, newborns typically need...' or 'Lactation guidelines suggest looking for...') rather than "
+            "diagnosing the user.\n"
+            "4. Conclude with clear, low-stress parameters on when they should reach out to a healthcare provider or IBCLC.\n\n"
             f"{intent_handling_directive}"
-            f"Grounding Context:\n{retrieved_context}\n\n"
-            "Keep formatting clean using simple Markdown bullet points and bold headers."
+            "GROUNDING CONTEXT (Reference Materials Only - Do not assume the patient matches this):\n"
+            f"{retrieved_context}\n\n"
+            "IMPORTANT: Do not mention mastitis unless the user brings it up or systemic symptoms like fever are present. "
+            "Formatting: Use clear, simple Markdown with bold section headers."
         )
 
     history_context = build_conversation_text(chat_history)
     full_prompt = (
-        f"### Instruction:\n{system_prompt}\n\n"
-        f"### Conversation History:\n{history_context if history_context else 'No prior history.'}\n\n"
-        f"### Current User Input:\n{user_input}\n\n"
-        f"### Response:\n"
+        f"### SYSTEM INSTRUCTION:\n{system_prompt}\n\n"
+        f"### CONVERSATION HISTORY:\n{history_context if history_context else 'No prior history.'}\n\n"
+        f"### ACTUAL PATIENT INPUT:\n\"{user_input}\"\n\n"
+        f"### ASSISTANT RESPONSE:\n"
     )
 
     try:
@@ -342,7 +396,7 @@ def submit():
             model=MODEL, 
             prompt=full_prompt,
             options={
-                "num_predict": 350,   
+                "num_predict": 600,   
                 "temperature": 0.2,   
                 "top_k": 20           
             }
@@ -357,23 +411,23 @@ def submit():
                 turn_number=len(chat_history) // 2 + 1,
                 route=route,
                 scores={
-                    "pain":    float(scores["pain"]),
-                    "latch":   float(scores["latch"]),
-                    "supply":  float(scores["supply"]),
-                    "stress":  float(scores["stress"]),
-                    "urgency": float(scores["red_flag"]),
-                },
-                flags={
                     "pain":    scores["pain"],
                     "latch":   scores["latch"],
                     "supply":  scores["supply"],
                     "stress":  scores["stress"],
                     "urgency": scores["red_flag"],
                 },
+                flags={
+                    "pain":    flags["pain"],
+                    "latch":   flags["latch"],
+                    "supply":  flags["supply"],
+                    "stress":  flags["stress"],
+                    "urgency": flags["red_flag"],
+                },
                 detail_level=detect_detail_level(user_input),
                 conv_state=get_conversation_state(chat_history),
                 retrieval_chunks=[retrieved_context] if retrieved_context else [],
-                retrieval_scores=[0.5] if retrieved_context else [],
+                retrieval_scores=retrieval_scores_list,
                 user_msg_len=len(user_input),
                 baby_age_known=baby_age_known(chat_history, user_input),
                 is_closing=is_closing_message(user_input),
@@ -400,4 +454,4 @@ def reset():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    app.run(debug=True, port=5002)

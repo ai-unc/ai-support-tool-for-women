@@ -290,8 +290,8 @@ def run_routing_eval(verbose=False):
     results = []
 
     for case in ROUTING_TEST_CASES:
-        scores = score_text_concern(case["input"], case["history"])
-        actual = route_request(scores, case["input"], case["history"])
+        scores, flags = score_text_concern(case["input"], case["history"])
+        actual = route_request(scores, flags, case["input"], case["history"])
         ok = actual == case["expected"]
 
         if ok:
@@ -309,12 +309,14 @@ def run_routing_eval(verbose=False):
             "note": case["note"],
             "input": case["input"],
             "scores": scores,
+            "flags": flags,
         })
 
         print(f"  [{case['id']}] {status}  expected={case['expected']:<15} got={actual:<15}  — {case['note']}")
         if verbose and not ok:
             print(f"        Input: \"{case['input'][:80]}\"")
             print(f"        Scores: {scores}")
+            print(f"        Flags:  {flags}")
 
     total = passed + failed
     pct = (passed / total) * 100
@@ -325,6 +327,7 @@ def run_routing_eval(verbose=False):
             if not r["ok"]:
                 print(f"    [{r['id']}] expected {r['expected']}, got {r['actual']}")
                 print(f"         Scores: {r['scores']}")
+                print(f"         Flags:  {r['flags']}")
     return passed, total
 
 
