@@ -1,22 +1,47 @@
-annotated-types==0.7.0
-anyio==4.12.1
-blinker==1.9.0
-certifi==2026.2.25
-click==8.1.8
-exceptiongroup==1.3.1
+# Web framework
 Flask==3.1.3
-h11==0.16.0
-httpcore==1.0.9
-httpx==0.28.1
-idna==3.11
-importlib_metadata==8.7.1
+Flask-Session==0.8.0
+Werkzeug==3.1.8
+
+# LLM (local inference via Ollama)
+ollama==0.6.1
+
+# Embeddings + vector search
+sentence-transformers==3.4.1
+faiss-cpu==1.10.0
+numpy==2.2.4
+
+# Markdown rendering
+Markdown==3.7
+
+# Flask internals
+blinker==1.9.0
+click==8.1.8
 itsdangerous==2.2.0
 Jinja2==3.1.6
 MarkupSafe==3.0.3
-ollama==0.6.1
+
+# HTTP / async
+anyio==4.12.1
+certifi==2026.2.25
+httpx==0.28.1
+httpcore==1.0.9
+h11==0.16.0
+idna==3.11
+
+# Pydantic (used by ollama SDK)
 pydantic==2.13.3
 pydantic_core==2.46.3
-typing-inspection==0.4.2
+annotated-types==0.7.0
 typing_extensions==4.15.0
-Werkzeug==3.1.8
+
+# Misc
+importlib_metadata==8.7.1
 zipp==3.23.1
+ADDITIONAL_REQUIREMENTS = """
+# Analytics dashboard
+streamlit==1.45.1
+plotly==5.24.1
+pandas==2.2.3
+"""
+ 
