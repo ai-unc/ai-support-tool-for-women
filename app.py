@@ -60,6 +60,34 @@ THRESHOLDS = {
     "concern": 0.20,
 }
 
+# --- NEW: off-topic detection ---------------------------------------------
+# Keywords that indicate the query is outside the breastfeeding/lactation
+# support domain entirely (general healthcare logistics, unrelated life
+# topics, etc). Kept intentionally broad since a false positive here just
+# means falling back to a polite redirect rather than a mis-triaged clinical
+# workflow.
+OFF_TOPIC_KEYWORDS = [
+    "hospital", "hospitals", "childcare", "child care", "daycare", "day care",
+    "insurance", "pediatrician recommendation", "recommend a doctor",
+    "school", "custody", "lawyer", "immigration", "housing", "job", "career",
+]
+
+# Minimum retrieval similarity required to consider a query "in-domain".
+# If nothing in the knowledge base is even loosely relevant, that's a strong
+# signal this isn't a breastfeeding/lactation question at all.
+RETRIEVAL_OFF_TOPIC_THRESHOLD = 0.35
+
+
+def is_off_topic(user_input, retrieval_scores_list):
+    text = user_input.lower()
+    if any(kw in text for kw in OFF_TOPIC_KEYWORDS):
+        return True
+    if retrieval_scores_list and max(retrieval_scores_list) < RETRIEVAL_OFF_TOPIC_THRESHOLD:
+        return True
+    return False
+# ---------------------------------------------------------------------------
+
+
 def clean_output(text):
     return md.markdown(text)
 
@@ -195,7 +223,7 @@ def is_closing_message(user_input):
     return any(phrase in user_input.lower() for phrase in closing_words)
 
 
-def route_request(scores, flags, user_input, chat_history):
+def route_request(scores, flags, user_input, chat_history, retrieval_scores_list=None):
     if is_closing_message(user_input):
         return "CLOSING"
 
@@ -206,6 +234,13 @@ def route_request(scores, flags, user_input, chat_history):
         return "URGENT_LOW_COUNTS"
     elif flag_status == "MATERNAL_URGENT":
         return "URGENT_MATERNAL"
+
+    # NEW: off-topic gate. Runs after red-flag checks (safety always first)
+    # but before any breastfeeding-specific routing logic, so unrelated
+    # queries (e.g. hospital/childcare recommendations) never fall into the
+    # clinical triage flow.
+    if is_off_topic(user_input, retrieval_scores_list):
+        return "OFF_TOPIC"
 
     if flags["pain"] or flags["latch"]:
         if not needs_clarification(user_input, chat_history):
@@ -240,7 +275,14 @@ def submit():
     chat_history = session["chat_history"]
 
     scores, flags = score_text_concern(user_input, chat_history)
-    route = route_request(scores, flags, user_input, chat_history)
+
+    # Retrieval is now run up-front (rather than only inside the CLINICAL/etc.
+    # branch below) so its similarity scores can inform the off-topic gate
+    # in route_request(). k=2 kept the same as before.
+    search_results, retrieval_scores_list = search(user_input, faiss_index, chunks, k=2)
+    retrieved_context = "\n".join(search_results) if search_results else ""
+
+    route = route_request(scores, flags, user_input, chat_history, retrieval_scores_list)
     flag_status = check_hard_medical_red_flags(user_input, chat_history)
     
     if flag_status == "INFANT_CRISIS":
@@ -284,12 +326,56 @@ def submit():
         """
         return render_template("result.html", user_input=user_input, response=maternal_response)
 
-    retrieved_context = ""
-    retrieval_scores_list = []
-    if route in ["CLINICAL", "URGENT_INFANT", "URGENT_LOW_COUNTS", "URGENT_MATERNAL", "QUESTION_FIRST", "SUPPORT"]:
-        search_results, retrieval_scores_list = search(user_input, faiss_index, chunks, k=2)
-        if search_results:
-            retrieved_context = "\n".join(search_results)
+    # NEW: off-topic branch. Handled with a static response and no LLM call
+    # (saves a generate() round trip, and guarantees it never drifts into
+    # asking feeding-triage questions for unrelated requests).
+    elif route == "OFF_TOPIC":
+        off_topic_response = """
+        <div class="info-note">
+            <p>I'm focused specifically on breastfeeding and postpartum feeding support,
+            so I'm not the right resource for that request. For hospital or childcare
+            recommendations, your insurance provider's directory or a local parent
+            resource line would be a better starting point.</p>
+        </div>
+        """
+
+        try:
+            session_id = session.get("session_id", str(uuid.uuid4()))
+            session["session_id"] = session_id
+            log_turn(
+                session_id=session_id,
+                turn_number=len(chat_history) // 2 + 1,
+                route=route,
+                scores={
+                    "pain":    scores["pain"],
+                    "latch":   scores["latch"],
+                    "supply":  scores["supply"],
+                    "stress":  scores["stress"],
+                    "urgency": scores["red_flag"],
+                },
+                flags={
+                    "pain":    flags["pain"],
+                    "latch":   flags["latch"],
+                    "supply":  flags["supply"],
+                    "stress":  flags["stress"],
+                    "urgency": flags["red_flag"],
+                },
+                detail_level=detect_detail_level(user_input),
+                conv_state=get_conversation_state(chat_history),
+                retrieval_chunks=[retrieved_context] if retrieved_context else [],
+                retrieval_scores=retrieval_scores_list,
+                user_msg_len=len(user_input),
+                baby_age_known=baby_age_known(chat_history, user_input),
+                is_closing=is_closing_message(user_input),
+            )
+        except Exception as log_err:
+            print(f"⚠️ Analytics Database Sync Skipped: {log_err}", flush=True)
+
+        chat_history.append({"role": "user", "content": user_input})
+        chat_history.append({"role": "assistant", "content": off_topic_response})
+        session["chat_history"] = chat_history
+
+        return render_template("result.html", user_input=user_input, response=off_topic_response)
 
     intent_handling_directive = (
         "USER INTENT HANDLING DIRECTIVE:\n"
