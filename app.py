@@ -2,24 +2,34 @@ import uuid
 from analytics import init_db, log_turn
 from flask import Flask, render_template, request, session, redirect
 from flask_session import Session
-import ollama
+from google import genai
+from google.genai import types
 import os
 import re
 import numpy as np
 from rag_embeddings import build_index, search, model as embedding_model
 from rag import load_knowledge
 import markdown as md
+import time
+print("NEW VERSION OF APP.PY IS RUNNING", flush=True)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev-only-key")
+app.secret_key = os.environ.get("SECRET_KEY")
+if not app.secret_key:
+    raise RuntimeError("SECRET_KEY is missing.")
 app.config["SESSION_TYPE"] = "filesystem"
 app.config["SESSION_FILE_DIR"] = "./.flask_sessions"
 
 Session(app) 
 init_db()
-client = ollama.Client()
+gemini_api_key = os.environ.get("GEMINI_API_KEY")
 
-MODEL = "llama3.2:3b"
+if not gemini_api_key:
+    raise RuntimeError("GEMINI_API_KEY is missing.")
+
+client = genai.Client(api_key=gemini_api_key)
+
+MODEL = "gemini-3.1-flash-lite"
 
 chunks = load_knowledge()
 faiss_index, embeddings, chunks = build_index(chunks)
@@ -268,7 +278,13 @@ def index():
 
 @app.route("/submit", methods=["POST"])
 def submit():
+    request_start = time.perf_counter()
+
+    print("\n==============================", flush=True)
+    print("New /submit request received", flush=True)
+
     user_input = request.form.get("user_input", "")
+    print(f"User input: {user_input}", flush=True)
     
     if "chat_history" not in session:
         session["chat_history"] = []
@@ -283,6 +299,7 @@ def submit():
     retrieved_context = "\n".join(search_results) if search_results else ""
 
     route = route_request(scores, flags, user_input, chat_history, retrieval_scores_list)
+    print(f"Selected route: {route}", flush=True)
     flag_status = check_hard_medical_red_flags(user_input, chat_history)
     
     if flag_status == "INFANT_CRISIS":
@@ -420,11 +437,6 @@ def submit():
             )
 
         system_prompt = (
-            f"{clarification_directive}\n"
-            f"Grounding Context (Use for tone only, do not cite facts yet):\n{retrieved_context}\n"
-        )
-
-        system_prompt = (
             f"{clarification_directive}"
             f"Grounding Context:\n{retrieved_context}\n\n"
         )
@@ -478,20 +490,31 @@ def submit():
     )
 
     try:
-        response = client.generate(
-            model=MODEL, 
-            prompt=full_prompt,
-            options={
-                "num_predict": 600,   
-                "temperature": 0.2,   
-                "top_k": 20           
-            }
+        print("Prompt characters:", len(full_prompt), flush=True)
+
+        start_time = time.time()
+
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=full_prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=400,
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=0
+                ),
+            ),
         )
-        ai_text = response['response']
+
+        elapsed_time = time.time() - start_time
+        print(f"Gemini request took {elapsed_time:.2f} seconds", flush=True)
+
+        ai_text = response.text
 
         try:
             session_id = session.get("session_id", str(uuid.uuid4()))
             session["session_id"] = session_id
+            analytics_start = time.perf_counter()
             log_turn(
                 session_id=session_id,
                 turn_number=len(chat_history) // 2 + 1,
@@ -518,6 +541,8 @@ def submit():
                 baby_age_known=baby_age_known(chat_history, user_input),
                 is_closing=is_closing_message(user_input),
             )
+            analytics_elapsed = time.perf_counter() - analytics_start
+            print(f"Analytics logging took {analytics_elapsed:.2f} seconds", flush=True)
         except Exception as log_err:
             print(f"⚠️ Analytics Database Sync Skipped: {log_err}", flush=True)
 
@@ -526,7 +551,10 @@ def submit():
         session["chat_history"] = chat_history
 
         html_response = md.markdown(ai_text)
+        total_elapsed = time.perf_counter() - request_start
+        print(f"Total request took {total_elapsed:.2f} seconds", flush=True)
         return render_template("result.html", user_input=user_input, response=html_response)
+    
 
     except Exception as e:
         print(f"💥 Backend Prompt Generation Error: {e}", flush=True)
@@ -540,4 +568,5 @@ def reset():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5003)
+    port = int(os.environ.get("PORT", 5003))
+    app.run(host='0.0.0.0', port=port)
