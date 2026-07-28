@@ -57,3 +57,4 @@ typing_extensions==4.16.0
 Werkzeug==3.1.8
 google-genai==2.14.0
 Markdown
+gunicorn==23.0.0
